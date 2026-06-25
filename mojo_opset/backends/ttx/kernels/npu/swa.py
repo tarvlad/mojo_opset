@@ -41,6 +41,7 @@ def get_aux_mask():
 
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 
 
 @triton.jit
@@ -242,6 +243,149 @@ def _sdpa_acc_fwd_MxN(
     # NOTE(zhangjihang): for training
     # Return accumulated output acc_ptr, softmax denominator l_i, and max value m_i
     return acc_ptr, l_i, m_i
+
+
+@triton.jit
+def _sdpa_qk_fwd_MxN_local(
+    l_i,
+    m_i,
+    q,
+    k,
+    mask,
+    qk_scale,
+):
+    k_T = tl.trans(k)
+    qk = tl.dot(q, k_T)
+    qk = qk * qk_scale
+    if mask is not None and mask is not True:
+        qk = tl.where(mask, qk, -1e6)
+
+    m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
+    qk = qk - m_ij[:, None]
+    p = tl.math.exp(qk)
+    p_cast = p.to(k_T.dtype)
+    l_ij = tl.sum(p, 1)
+    alpha = tl.math.exp(m_i - m_ij)
+    l_i = l_i * alpha + l_ij
+    m_i = m_ij
+
+    return p_cast, alpha, l_i, m_i
+
+
+@triton.jit
+def _sdpa_pv_fwd_MxN_local(
+    acc_ptr,
+    p_cast,
+    alpha,
+    v,
+):
+    acc_ptr = acc_ptr * alpha[:, None]
+    acc_ptr = tl.dot(p_cast, v, acc_ptr)
+    return acc_ptr
+
+
+@triton.jit
+def _load_paged_k_concat(
+    k_ptr,
+    block_table_ptr,
+    b_id,
+    kv_head_id,
+    kv_block_start,
+    kv_seq_len,
+    stride_kp,
+    stride_kh,
+    stride_kt,
+    stride_kd,
+    stride_block_table_b,
+    stride_block_table_p,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_FRAGMENT_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N % PAGE_FRAGMENT_N == 0, "BLOCK_N must be composed from whole page fragments")
+    tl.static_assert(PAGE_SIZE % PAGE_FRAGMENT_N == 0, "PAGE_FRAGMENT_N must not cross a physical page")
+
+    k_concat = tl.zeros((BLOCK_N, BLOCK_D), dtype=k_ptr.dtype.element_ty)
+    frag_n = tl.arange(0, PAGE_FRAGMENT_N)[:, None]
+    frag_d = tl.arange(0, BLOCK_D)[None, :]
+
+    for frag_idx in tl.static_range(0, BLOCK_N // PAGE_FRAGMENT_N):
+        logical_start = kv_block_start + frag_idx * PAGE_FRAGMENT_N
+        logical_page_id = logical_start // PAGE_SIZE
+        page_offset = logical_start - logical_page_id * PAGE_SIZE
+        physical_page_id = tl.load(
+            block_table_ptr + b_id * stride_block_table_b + logical_page_id * stride_block_table_p,
+            mask=logical_start < kv_seq_len,
+            other=0,
+        )
+        valid = (logical_start + frag_n < kv_seq_len) & (frag_d < HEAD_DIM)
+        k_frag = tl.load(
+            k_ptr
+            + physical_page_id * stride_kp
+            + kv_head_id * stride_kh
+            + (page_offset + frag_n) * stride_kt
+            + frag_d * stride_kd,
+            mask=valid,
+            other=0.0,
+        )
+        dst_offset = frag_idx * PAGE_FRAGMENT_N
+        k_concat = al.insert_slice(k_concat, k_frag, (dst_offset, 0), (PAGE_FRAGMENT_N, BLOCK_D), (1, 1))
+
+    return k_concat
+
+
+@triton.jit
+def _load_paged_v_concat(
+    v_ptr,
+    block_table_ptr,
+    b_id,
+    kv_head_id,
+    kv_block_start,
+    kv_seq_len,
+    stride_vp,
+    stride_vh,
+    stride_vt,
+    stride_vd,
+    stride_block_table_b,
+    stride_block_table_p,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_FRAGMENT_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N % PAGE_FRAGMENT_N == 0, "BLOCK_N must be composed from whole page fragments")
+    tl.static_assert(PAGE_SIZE % PAGE_FRAGMENT_N == 0, "PAGE_FRAGMENT_N must not cross a physical page")
+
+    v_concat = tl.zeros((BLOCK_N, BLOCK_D), dtype=v_ptr.dtype.element_ty)
+    frag_n = tl.arange(0, PAGE_FRAGMENT_N)[:, None]
+    frag_d = tl.arange(0, BLOCK_D)[None, :]
+
+    for frag_idx in tl.static_range(0, BLOCK_N // PAGE_FRAGMENT_N):
+        logical_start = kv_block_start + frag_idx * PAGE_FRAGMENT_N
+        logical_page_id = logical_start // PAGE_SIZE
+        page_offset = logical_start - logical_page_id * PAGE_SIZE
+        physical_page_id = tl.load(
+            block_table_ptr + b_id * stride_block_table_b + logical_page_id * stride_block_table_p,
+            mask=logical_start < kv_seq_len,
+            other=0,
+        )
+        valid = (logical_start + frag_n < kv_seq_len) & (frag_d < HEAD_DIM)
+        v_frag = tl.load(
+            v_ptr
+            + physical_page_id * stride_vp
+            + kv_head_id * stride_vh
+            + (page_offset + frag_n) * stride_vt
+            + frag_d * stride_vd,
+            mask=valid,
+            other=0.0,
+        )
+        dst_offset = frag_idx * PAGE_FRAGMENT_N
+        v_concat = al.insert_slice(v_concat, v_frag, (dst_offset, 0), (PAGE_FRAGMENT_N, BLOCK_D), (1, 1))
+
+    return v_concat
 
 
 @triton.jit
@@ -674,10 +818,12 @@ def _swa_paged_prefill_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_FRAGMENT_N: tl.constexpr,
     skip_window_mask: tl.constexpr,
 ):
     tl.static_assert(HEAD_DIM <= BLOCK_D, "BLOCK_SIZE_D should not be less than HEAD_DIM")
-    tl.static_assert(PAGE_SIZE % BLOCK_N == 0, "BLOCK_N must be a divisor of PAGE_SIZE")
+    tl.static_assert(BLOCK_N % PAGE_FRAGMENT_N == 0, "BLOCK_N must be composed from whole page fragments")
+    tl.static_assert(PAGE_SIZE % PAGE_FRAGMENT_N == 0, "PAGE_FRAGMENT_N must not cross a physical page")
 
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
@@ -770,13 +916,6 @@ def _swa_paged_prefill_kernel(
 
             for kv_block_id in range(num_global_window_blocks):
                 kv_block_start = kv_block_id * BLOCK_N
-                kv_block_end = min(kv_block_start + BLOCK_N, kv_seq_len)
-                kv_block_len = kv_block_end - kv_block_start
-                logical_page_id = kv_block_start // PAGE_SIZE
-                kv_block_start_in_page = kv_block_start % PAGE_SIZE
-                physical_page_id = tl.load(
-                    block_table_ptr + b_id * stride_block_table_b + logical_page_id * stride_block_table_p
-                )
                 kv_mask = gen_mask_n_right_bound(
                     aux_mask_ptr_10,
                     aux_mask_size,
@@ -825,47 +964,61 @@ def _swa_paged_prefill_kernel(
                     mask = mask_causal & q_mask & kv_mask
                 else:
                     mask = q_mask & kv_mask
-                cur_k_block_ptr = tl.make_block_ptr(
-                    base=k_ptr + physical_page_id * stride_kp + kv_head_id * stride_kh + kv_block_start_in_page * stride_kt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                k_concat = _load_paged_k_concat(
+                    k_ptr,
+                    block_table_ptr,
+                    b_id,
+                    kv_head_id,
+                    kv_block_start,
+                    kv_seq_len,
+                    stride_kp,
+                    stride_kh,
+                    stride_kt,
+                    stride_kd,
+                    stride_block_table_b,
+                    stride_block_table_p,
+                    PAGE_SIZE,
+                    PAGE_FRAGMENT_N,
+                    BLOCK_N,
+                    BLOCK_D,
+                    HEAD_DIM,
                 )
-                cur_v_block_ptr = tl.make_block_ptr(
-                    base=v_ptr + physical_page_id * stride_vp + kv_head_id * stride_vh + kv_block_start_in_page * stride_vt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_vt, stride_vd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
-                acc, l_i, m_i = _sdpa_acc_fwd_MxN(
-                    acc,
+                p_cast, alpha, l_i, m_i = _sdpa_qk_fwd_MxN_local(
                     l_i,
                     m_i,
                     cur_q_block,
-                    cur_k_block_ptr,
-                    cur_v_block_ptr,
+                    k_concat,
                     mask,
                     scale,
-                    HEAD_DIM,
-                    BLOCK_M,
+                )
+                v_concat = _load_paged_v_concat(
+                    v_ptr,
+                    block_table_ptr,
+                    b_id,
+                    kv_head_id,
+                    kv_block_start,
+                    kv_seq_len,
+                    stride_vp,
+                    stride_vh,
+                    stride_vt,
+                    stride_vd,
+                    stride_block_table_b,
+                    stride_block_table_p,
+                    PAGE_SIZE,
+                    PAGE_FRAGMENT_N,
                     BLOCK_N,
                     BLOCK_D,
-                    v_ptr.dtype.element_ty == tl.float8e5,
+                    HEAD_DIM,
+                )
+                acc = _sdpa_pv_fwd_MxN_local(
+                    acc,
+                    p_cast,
+                    alpha,
+                    v_concat,
                 )
 
             for kv_block_id in range(non_global_window_start_block, num_total_blocks):
                 kv_block_start = kv_block_id * BLOCK_N
-                kv_block_end = min(kv_block_start + BLOCK_N, kv_seq_len)
-                kv_block_len = kv_block_end - kv_block_start
-                logical_page_id = kv_block_start // PAGE_SIZE
-                kv_block_start_in_page = kv_block_start % PAGE_SIZE
-                physical_page_id = tl.load(
-                    block_table_ptr + b_id * stride_block_table_b + logical_page_id * stride_block_table_p
-                )
                 kv_mask = gen_mask_n_right_bound(
                     aux_mask_ptr_10,
                     aux_mask_size,
@@ -903,36 +1056,57 @@ def _swa_paged_prefill_kernel(
                 else:
                     mask = q_mask & kv_mask
 
-                cur_k_block_ptr = tl.make_block_ptr(
-                    base=k_ptr + physical_page_id * stride_kp + kv_head_id * stride_kh + kv_block_start_in_page * stride_kt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                k_concat = _load_paged_k_concat(
+                    k_ptr,
+                    block_table_ptr,
+                    b_id,
+                    kv_head_id,
+                    kv_block_start,
+                    kv_seq_len,
+                    stride_kp,
+                    stride_kh,
+                    stride_kt,
+                    stride_kd,
+                    stride_block_table_b,
+                    stride_block_table_p,
+                    PAGE_SIZE,
+                    PAGE_FRAGMENT_N,
+                    BLOCK_N,
+                    BLOCK_D,
+                    HEAD_DIM,
                 )
-                cur_v_block_ptr = tl.make_block_ptr(
-                    base=v_ptr + physical_page_id * stride_vp + kv_head_id * stride_vh + kv_block_start_in_page * stride_vt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_vt, stride_vd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
-                acc, l_i, m_i = _sdpa_acc_fwd_MxN(
-                    acc,
+                p_cast, alpha, l_i, m_i = _sdpa_qk_fwd_MxN_local(
                     l_i,
                     m_i,
                     cur_q_block,
-                    cur_k_block_ptr,
-                    cur_v_block_ptr,
+                    k_concat,
                     mask,
                     scale,
-                    HEAD_DIM,
-                    BLOCK_M,
+                )
+                v_concat = _load_paged_v_concat(
+                    v_ptr,
+                    block_table_ptr,
+                    b_id,
+                    kv_head_id,
+                    kv_block_start,
+                    kv_seq_len,
+                    stride_vp,
+                    stride_vh,
+                    stride_vt,
+                    stride_vd,
+                    stride_block_table_b,
+                    stride_block_table_p,
+                    PAGE_SIZE,
+                    PAGE_FRAGMENT_N,
                     BLOCK_N,
                     BLOCK_D,
-                    v_ptr.dtype.element_ty == tl.float8e5,
+                    HEAD_DIM,
+                )
+                acc = _sdpa_pv_fwd_MxN_local(
+                    acc,
+                    p_cast,
+                    alpha,
+                    v_concat,
                 )
 
             # cur_o_block_ptr = tl.advance(o_block_ptr, (q_block_start.to(tl.int32), 0))
@@ -990,10 +1164,12 @@ def _swa_paged_prefill_small_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_FRAGMENT_N: tl.constexpr,
     skip_window_mask: tl.constexpr,
 ):
     tl.static_assert(HEAD_DIM <= BLOCK_D, "BLOCK_SIZE_D should not be less than HEAD_DIM")
-    tl.static_assert(PAGE_SIZE % BLOCK_N == 0, "BLOCK_N must be a divisor of PAGE_SIZE")
+    tl.static_assert(BLOCK_N % PAGE_FRAGMENT_N == 0, "BLOCK_N must be composed from whole page fragments")
+    tl.static_assert(PAGE_SIZE % PAGE_FRAGMENT_N == 0, "PAGE_FRAGMENT_N must not cross a physical page")
 
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
@@ -1086,13 +1262,6 @@ def _swa_paged_prefill_small_kernel(
 
             for kv_block_id in range(num_total_blocks):
                 kv_block_start = kv_block_id * BLOCK_N
-                kv_block_end = min(kv_block_start + BLOCK_N, kv_seq_len)
-                kv_block_len = kv_block_end - kv_block_start
-                logical_page_id = kv_block_start // PAGE_SIZE
-                kv_block_start_in_page = kv_block_start % PAGE_SIZE
-                physical_page_id = tl.load(
-                    block_table_ptr + b_id * stride_block_table_b + logical_page_id * stride_block_table_p
-                )
                 kv_mask = gen_mask_n_right_bound(
                     aux_mask_ptr_10,
                     aux_mask_size,
@@ -1146,40 +1315,59 @@ def _swa_paged_prefill_small_kernel(
                     mask = mask_vis & q_mask & kv_mask
                 else:
                     mask = q_mask & kv_mask
-                cur_k_block_ptr = tl.make_block_ptr(
-                    base=k_ptr + physical_page_id * stride_kp + kv_head_id * stride_kh + kv_block_start_in_page * stride_kt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
-                cur_v_block_ptr = tl.make_block_ptr(
-                    base=v_ptr + physical_page_id * stride_vp + kv_head_id * stride_vh + kv_block_start_in_page * stride_vt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_vt, stride_vd),
-                    offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
-                )
                 if mask is not False:
-                    k = tl.load(cur_k_block_ptr, boundary_check=(0,), padding_option="zero")
-                    k_T = tl.trans(k)
-                    qk = tl.dot(cur_q_block, k_T)
-                    qk = qk * scale
-                    if mask is not None and mask is not True:
-                        qk = tl.where(mask, qk, -1e6)
-                    m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
-                    qk = qk - m_ij[:, None]
-                    p = tl.math.exp(qk)
-                    p_cast = p.to(k_T.dtype)
-                    v = tl.load(cur_v_block_ptr, boundary_check=(0, ), padding_option="zero")
-                    l_ij = tl.sum(p, 1)
-                    alpha = tl.math.exp(m_i - m_ij)
-                    l_i = l_i * alpha + l_ij
-                    acc = acc * alpha[:, None]
-                    acc = tl.dot(p_cast, v, acc)
-                    m_i = m_ij
+                    k_concat = _load_paged_k_concat(
+                        k_ptr,
+                        block_table_ptr,
+                        b_id,
+                        kv_head_id,
+                        kv_block_start,
+                        kv_seq_len,
+                        stride_kp,
+                        stride_kh,
+                        stride_kt,
+                        stride_kd,
+                        stride_block_table_b,
+                        stride_block_table_p,
+                        PAGE_SIZE,
+                        PAGE_FRAGMENT_N,
+                        BLOCK_N,
+                        BLOCK_D,
+                        HEAD_DIM,
+                    )
+                    p_cast, alpha, l_i, m_i = _sdpa_qk_fwd_MxN_local(
+                        l_i,
+                        m_i,
+                        cur_q_block,
+                        k_concat,
+                        mask,
+                        scale,
+                    )
+                    v_concat = _load_paged_v_concat(
+                        v_ptr,
+                        block_table_ptr,
+                        b_id,
+                        kv_head_id,
+                        kv_block_start,
+                        kv_seq_len,
+                        stride_vp,
+                        stride_vh,
+                        stride_vt,
+                        stride_vd,
+                        stride_block_table_b,
+                        stride_block_table_p,
+                        PAGE_SIZE,
+                        PAGE_FRAGMENT_N,
+                        BLOCK_N,
+                        BLOCK_D,
+                        HEAD_DIM,
+                    )
+                    acc = _sdpa_pv_fwd_MxN_local(
+                        acc,
+                        p_cast,
+                        alpha,
+                        v_concat,
+                    )
 
 
             # cur_o_block_ptr = tl.advance(o_block_ptr, (q_block_start.to(tl.int32), 0))
@@ -1220,10 +1408,11 @@ def swa_paged_prefill_impl(
     o = torch.zeros_like(q, memory_format=torch.contiguous_format)
     if q.dtype == torch.float32:
         BLOCK_M = min(64, triton.next_power_of_2(tot_q_toks))
-        BLOCK_N = min(64, triton.next_power_of_2(page_size))
+        BLOCK_N = 64 if page_size <= 64 and 64 % page_size == 0 else min(64, triton.next_power_of_2(page_size))
     else:
         BLOCK_M = min(128, triton.next_power_of_2(tot_q_toks))
-        BLOCK_N = min(128, triton.next_power_of_2(page_size))
+        BLOCK_N = 128 if page_size <= 128 and 128 % page_size == 0 else min(128, triton.next_power_of_2(page_size))
+    PAGE_FRAGMENT_N = min(page_size, BLOCK_N)
 
     BLOCK_D = head_dim
     cube_num = get_num_cores("cube")
@@ -1278,7 +1467,16 @@ def swa_paged_prefill_impl(
         BLOCK_N,
         BLOCK_D,
         page_size,
+        PAGE_FRAGMENT_N,
         skip_window_mask,
+        multibuffer=True,
+        unit_flag=True,
+        enable_hivm_auto_cv_balance=True,
+        limit_auto_multi_buffer_only_for_local_buffer=False,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        set_workspace_multibuffer=4,
+        tile_mix_vector_loop=8,
+        tile_mix_cube_loop=4,
     )
     return o
 
