@@ -1410,7 +1410,7 @@ def swa_paged_prefill_impl(
         BLOCK_M = min(64, triton.next_power_of_2(tot_q_toks))
         BLOCK_N = 64 if page_size <= 64 and 64 % page_size == 0 else min(64, triton.next_power_of_2(page_size))
     else:
-        BLOCK_M = min(128, triton.next_power_of_2(tot_q_toks))
+        BLOCK_M = min(64, triton.next_power_of_2(tot_q_toks))
         BLOCK_N = 128 if page_size <= 128 and 128 % page_size == 0 else min(128, triton.next_power_of_2(page_size))
     PAGE_FRAGMENT_N = min(page_size, BLOCK_N)
 
@@ -1469,14 +1469,6 @@ def swa_paged_prefill_impl(
         page_size,
         PAGE_FRAGMENT_N,
         skip_window_mask,
-        multibuffer=True,
-        unit_flag=True,
-        enable_hivm_auto_cv_balance=True,
-        limit_auto_multi_buffer_only_for_local_buffer=False,
-        limit_auto_multi_buffer_of_local_buffer="no-l0c",
-        set_workspace_multibuffer=4,
-        tile_mix_vector_loop=8,
-        tile_mix_cube_loop=4,
     )
     return o
 
